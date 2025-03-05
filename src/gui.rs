@@ -1,0 +1,437 @@
+use std::time::Duration;
+
+use log::debug;
+use smithay_client_toolkit::{
+    compositor::CompositorHandler,
+    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
+    delegate_registry, delegate_seat, delegate_shm,
+    output::{OutputHandler, OutputState},
+    reexports::{
+        calloop::{EventLoop, LoopHandle},
+        calloop_wayland_source::WaylandSource,
+    },
+    registry::{ProvidesRegistryState, RegistryState},
+    registry_handlers,
+    seat::{keyboard::KeyboardHandler, pointer::PointerHandler, SeatHandler, SeatState},
+    shell::{
+        wlr_layer::{
+            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
+        },
+        WaylandSurface,
+    },
+    shm::{slot::SlotPool, Shm, ShmHandler},
+};
+use smithay_client_toolkit::{
+    reexports::client::{
+        globals::registry_queue_init,
+        protocol::{wl_keyboard, wl_pointer, wl_shm},
+        Connection, QueueHandle,
+    },
+    seat::pointer::PointerEventKind,
+};
+
+enum Action {
+    EXIT,
+}
+pub struct AppDate {}
+
+struct Foam {
+    registry_state: RegistryState,
+    seat_state: SeatState,
+    output_state: OutputState,
+    shm: Shm,
+
+    layer: LayerSurface,
+    pointer: Option<wl_pointer::WlPointer>,
+    scale_factor: i32,
+    pool: SlotPool,
+
+    is_show: bool,
+    has_init: bool,
+    next_action: Option<Action>,
+
+    app: AppDate,
+
+    width: u32,
+    height: u32,
+
+    loop_handle: LoopHandle<'static, Foam>,
+}
+
+impl Foam {
+    pub fn draw(&mut self, qh: &QueueHandle<Self>) {
+        let width = self.width * self.scale_factor as u32;
+        let height = self.height * self.scale_factor as u32;
+        let stride = width as i32 * 4;
+
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(
+                width as i32,
+                height as i32,
+                stride,
+                wl_shm::Format::Argb8888,
+            )
+            .expect("Failed to create buffer");
+
+        let color = 0x80FFFFFFu32.to_ne_bytes();
+        for pixel in canvas.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&color);
+        }
+
+        self.layer
+            .wl_surface()
+            .damage_buffer(0, 0, width as i32, height as i32);
+
+        self.layer
+            .wl_surface()
+            .frame(qh, self.layer.wl_surface().clone());
+
+        buffer
+            .attach_to(self.layer.wl_surface())
+            .expect("buffer attach err");
+
+        self.layer.commit();
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32, qh: &QueueHandle<Self>) {
+        self.width = width;
+        self.height = height;
+        self.draw(qh);
+    }
+}
+
+impl CompositorHandler for Foam {
+    fn scale_factor_changed(
+        &mut self,
+        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
+        new_factor: i32,
+    ) {
+        self.scale_factor = new_factor;
+        self.layer.set_buffer_scale(new_factor as u32).unwrap();
+    }
+
+    fn transform_changed(
+        &mut self,
+        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
+        _new_transform: smithay_client_toolkit::reexports::client::protocol::wl_output::Transform,
+    ) {
+    }
+
+    fn frame(
+        &mut self,
+        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
+        _time: u32,
+    ) {
+        self.draw(qh);
+    }
+
+    fn surface_enter(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
+        output: &smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
+    ) {
+    }
+
+    fn surface_leave(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
+        output: &smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
+    ) {
+    }
+}
+
+impl OutputHandler for Foam {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
+
+    fn new_output(
+        &mut self,
+        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        _output: smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
+    ) {
+    }
+
+    fn update_output(
+        &mut self,
+        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        _output: smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
+    ) {
+    }
+
+    fn output_destroyed(
+        &mut self,
+        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        _output: smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
+    ) {
+    }
+}
+
+impl LayerShellHandler for Foam {
+    fn closed(
+        &mut self,
+        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        _layer: &LayerSurface,
+    ) {
+        self.is_show = false;
+    }
+
+    fn configure(
+        &mut self,
+        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        _layer: &LayerSurface,
+        configure: smithay_client_toolkit::shell::wlr_layer::LayerSurfaceConfigure,
+        _serial: u32,
+    ) {
+        if configure.new_size.0 == 0 || configure.new_size.1 == 0 {
+            self.width = 256;
+            self.height = 256;
+        } else {
+            self.width = configure.new_size.0;
+            self.height = configure.new_size.1;
+        }
+
+        if !self.has_init {
+            self.has_init = true;
+            self.draw(qh);
+
+            println!("init");
+        }
+    }
+}
+
+impl KeyboardHandler for Foam {
+    fn enter(
+        &mut self,
+        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
+        _serial: u32,
+        _raw: &[u32],
+        _keysyms: &[smithay_client_toolkit::seat::keyboard::Keysym],
+    ) {
+    }
+
+    fn leave(
+        &mut self,
+        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
+        _serial: u32,
+    ) {
+    }
+
+    fn press_key(
+        &mut self,
+        conn: &smithay_client_toolkit::reexports::client::Connection,
+        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        keyboard: &wl_keyboard::WlKeyboard,
+        serial: u32,
+        event: smithay_client_toolkit::seat::keyboard::KeyEvent,
+    ) {
+        debug!("Key press: {event:?}");
+    }
+
+    fn release_key(
+        &mut self,
+        conn: &smithay_client_toolkit::reexports::client::Connection,
+        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        keyboard: &wl_keyboard::WlKeyboard,
+        serial: u32,
+        event: smithay_client_toolkit::seat::keyboard::KeyEvent,
+    ) {
+        debug!("Key release: {event:?}");
+    }
+
+    fn update_modifiers(
+        &mut self,
+        conn: &smithay_client_toolkit::reexports::client::Connection,
+        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        keyboard: &wl_keyboard::WlKeyboard,
+        serial: u32,
+        modifiers: smithay_client_toolkit::seat::keyboard::Modifiers,
+        layout: u32,
+    ) {
+        debug!("Update modifiers: {modifiers:?}");
+    }
+}
+
+impl PointerHandler for Foam {
+    fn pointer_frame(
+        &mut self,
+        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        events: &[smithay_client_toolkit::seat::pointer::PointerEvent],
+    ) {
+        use PointerEventKind::{Enter, Leave, Press};
+        for event in events {
+            if &event.surface != self.layer.wl_surface() {
+                continue;
+            }
+            match event.kind {
+                Enter { .. } => {
+                    self.resize(512, 512, qh); // 鼠标进入时扩大
+                }
+                Leave { .. } => {
+                    self.resize(256, 256, qh); // 鼠标离开时缩小
+                }
+                Press { .. } => {
+                    println!("click!");
+                    self.next_action = Some(Action::EXIT);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl SeatHandler for Foam {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(
+        &mut self,
+        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        _seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
+    ) {
+    }
+
+    fn new_capability(
+        &mut self,
+        conn: &smithay_client_toolkit::reexports::client::Connection,
+        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
+        capability: smithay_client_toolkit::seat::Capability,
+    ) {
+        if capability == smithay_client_toolkit::seat::Capability::Pointer && self.pointer.is_none()
+        {
+            debug!("Set pointer capability");
+            let pointer = self
+                .seat_state
+                .get_pointer(qh, &seat)
+                .expect("Failed to create pointer");
+            self.pointer = Some(pointer);
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        _seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
+        _capability: smithay_client_toolkit::seat::Capability,
+    ) {
+    }
+
+    fn remove_seat(
+        &mut self,
+        _conn: &smithay_client_toolkit::reexports::client::Connection,
+        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        _seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
+    ) {
+    }
+}
+
+impl ShmHandler for Foam {
+    fn shm_state(&mut self) -> &mut Shm {
+        &mut self.shm
+    }
+}
+
+impl ProvidesRegistryState for Foam {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+    registry_handlers![OutputState, SeatState];
+}
+
+pub fn run(app: AppDate) {
+    let conn = Connection::connect_to_env().unwrap();
+
+    let (globals, event_queue) = registry_queue_init(&conn).unwrap();
+    let qh = event_queue.handle();
+    let mut event_loop: EventLoop<Foam> =
+        EventLoop::try_new().expect("Failed to initialize event loop");
+    let loop_handle = event_loop.handle();
+    WaylandSource::new(conn, event_queue)
+        .insert(loop_handle)
+        .unwrap();
+    let compositor = smithay_client_toolkit::compositor::CompositorState::bind(&globals, &qh)
+        .expect("wl_compositor is not available");
+    let layer_shell = LayerShell::bind(&globals, &qh).expect("layer shell is not available");
+    let shm = Shm::bind(&globals, &qh).expect("wl_shm is not available");
+
+    let surface = compositor.create_surface(&qh);
+
+    let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Top, Some("Foam"), None);
+    layer.set_anchor(Anchor::TOP | Anchor::RIGHT);
+    layer.set_size(256, 256);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+
+    layer.commit();
+    let pool = SlotPool::new(256 * 256 * 4, &shm).expect("Failed to create pool");
+
+    let mut foam = Foam {
+        registry_state: RegistryState::new(&globals),
+        seat_state: SeatState::new(&globals, &qh),
+        output_state: OutputState::new(&globals, &qh),
+        shm,
+
+        is_show: true,
+        has_init: false,
+        pool,
+        width: 256,
+        height: 256,
+        layer,
+        pointer: None,
+        scale_factor: 1,
+        next_action: None,
+        loop_handle: event_loop.handle(),
+        app,
+    };
+
+    loop {
+        event_loop
+            .dispatch(Duration::from_millis(50), &mut foam)
+            .unwrap();
+        match &foam.next_action.take() {
+            Some(Action::EXIT) => foam.is_show = false,
+            _ => {}
+        }
+
+        if !foam.is_show {
+            debug!("exit!");
+            break;
+        }
+    }
+}
+
+delegate_compositor!(Foam);
+delegate_output!(Foam);
+delegate_shm!(Foam);
+delegate_seat!(Foam);
+delegate_keyboard!(Foam);
+delegate_pointer!(Foam);
+delegate_layer!(Foam);
+delegate_registry!(Foam);
