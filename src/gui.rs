@@ -338,7 +338,7 @@ impl PointerHandler for Foam {
                     self.next_action = Some(Action::EXIT);
                 }
                 Motion { .. } => {
-                    // println!("{} : {}", self.cursor.0, self.cursor.1);
+                    println!("{} : {}", self.cursor.0, self.cursor.1);
                 }
                 _ => {}
             }
@@ -428,7 +428,7 @@ pub fn run(app: AppDate) {
     let surface = compositor.create_surface(&qh);
 
     let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Top, Some("Foam"), None);
-    layer.set_anchor(Anchor::TOP | Anchor::LEFT);
+    layer.set_anchor(Anchor::LEFT | Anchor::RIGHT | Anchor::TOP | Anchor::BOTTOM);
     layer.set_margin(200, 0, 0, 400);
     layer.set_size(256, 256);
     layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
