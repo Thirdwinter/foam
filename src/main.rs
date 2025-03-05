@@ -1,7 +1,7 @@
 mod gui;
+mod imp_foam;
 
 fn main() {
-    println!("Hello, world!");
     let app = gui::AppDate {};
     gui::run(app);
 }
