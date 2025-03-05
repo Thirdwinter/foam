@@ -32,6 +32,13 @@ use smithay_client_toolkit::{
 
 enum Action {
     EXIT,
+    MAX,
+    MIN,
+}
+
+enum Status {
+    RUNNING,
+    CHANGE,
 }
 pub struct AppDate {}
 
@@ -51,6 +58,7 @@ struct Foam {
     next_action: Option<Action>,
 
     app: AppDate,
+    status: Option<Status>,
 
     width: u32,
     height: u32,
@@ -64,6 +72,8 @@ impl Foam {
         let height = self.height * self.scale_factor as u32;
         let stride = width as i32 * 4;
 
+        // 如果已经存在缓冲区，则手动清理
+
         let (buffer, canvas) = self
             .pool
             .create_buffer(
@@ -73,16 +83,14 @@ impl Foam {
                 wl_shm::Format::Argb8888,
             )
             .expect("Failed to create buffer");
-
+        canvas.fill(0);
         let color = 0x80FFFFFFu32.to_ne_bytes();
         for pixel in canvas.chunks_exact_mut(4) {
             pixel.copy_from_slice(&color);
         }
-
         self.layer
             .wl_surface()
             .damage_buffer(0, 0, width as i32, height as i32);
-
         self.layer
             .wl_surface()
             .frame(qh, self.layer.wl_surface().clone());
@@ -90,14 +98,16 @@ impl Foam {
         buffer
             .attach_to(self.layer.wl_surface())
             .expect("buffer attach err");
-
         self.layer.commit();
+
+        // 保存当前缓冲区以便后续清理
     }
 
     pub fn resize(&mut self, width: u32, height: u32, qh: &QueueHandle<Self>) {
         self.width = width;
         self.height = height;
-        self.draw(qh);
+        self.status = Some(Status::CHANGE);
+        self.draw(qh)
     }
 }
 
@@ -129,7 +139,18 @@ impl CompositorHandler for Foam {
         _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
         _time: u32,
     ) {
-        self.draw(qh);
+        match self.status.take() {
+            Some(Status::RUNNING) => {
+                return;
+            }
+            Some(Status::CHANGE) => {
+                println!("change!");
+                self.draw(qh);
+                self.status = Some(Status::RUNNING);
+            }
+
+            _ => {}
+        }
     }
 
     fn surface_enter(
@@ -194,7 +215,7 @@ impl LayerShellHandler for Foam {
     fn configure(
         &mut self,
         _conn: &smithay_client_toolkit::reexports::client::Connection,
-        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _layer: &LayerSurface,
         configure: smithay_client_toolkit::shell::wlr_layer::LayerSurfaceConfigure,
         _serial: u32,
@@ -278,7 +299,7 @@ impl PointerHandler for Foam {
     fn pointer_frame(
         &mut self,
         _conn: &smithay_client_toolkit::reexports::client::Connection,
-        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _pointer: &wl_pointer::WlPointer,
         events: &[smithay_client_toolkit::seat::pointer::PointerEvent],
     ) {
@@ -289,10 +310,12 @@ impl PointerHandler for Foam {
             }
             match event.kind {
                 Enter { .. } => {
-                    self.resize(512, 512, qh); // 鼠标进入时扩大
+                    println!("enter!");
+                    self.next_action = Some(Action::MAX); // 鼠标进入时扩大
                 }
                 Leave { .. } => {
-                    self.resize(256, 256, qh); // 鼠标离开时缩小
+                    println!("Leave!");
+                    self.next_action = Some(Action::MIN); // 鼠标离开时缩小
                 }
                 Press { .. } => {
                     println!("click!");
@@ -320,7 +343,7 @@ impl SeatHandler for Foam {
     fn new_capability(
         &mut self,
         conn: &smithay_client_toolkit::reexports::client::Connection,
-        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
         capability: smithay_client_toolkit::seat::Capability,
     ) {
@@ -403,6 +426,7 @@ pub fn run(app: AppDate) {
         pool,
         width: 256,
         height: 256,
+        status: Some(Status::RUNNING),
         layer,
         pointer: None,
         scale_factor: 1,
@@ -417,6 +441,14 @@ pub fn run(app: AppDate) {
             .unwrap();
         match &foam.next_action.take() {
             Some(Action::EXIT) => foam.is_show = false,
+            Some(Action::MAX) => {
+                foam.resize(512, 512, &qh);
+                println!("max")
+            }
+            Some(Action::MIN) => {
+                foam.resize(200, 200, &qh);
+                println!("MIN")
+            }
             _ => {}
         }
 
