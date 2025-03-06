@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+// use cairo::glib::bitflags::Flags;
 use log::debug;
 use smithay_client_toolkit::{
     compositor::CompositorHandler,
@@ -54,8 +55,8 @@ struct Foam {
     scale_factor: i32,
     pool: SlotPool,
 
-    is_show: bool,
-    has_init: bool,
+    exit: bool,
+    first_configure: bool,
     next_action: Option<Action>,
 
     app: AppDate,
@@ -73,6 +74,7 @@ impl Foam {
         let width = self.width * self.scale_factor as u32;
         let height = self.height * self.scale_factor as u32;
         let stride = width as i32 * 4;
+        self.layer.set_size(width, height);
 
         let (buffer, canvas) = self
             .pool
@@ -85,18 +87,57 @@ impl Foam {
             .expect("Failed to create buffer");
         canvas.fill(0);
 
-        let cx = width as i32 / 2;
-        let cy = height as i32 / 2;
-        let radius = (width.min(height) as f32 / 2.0).round() as i32;
-        let color = 0x801E1E2Eu32.to_ne_bytes();
+        // Define Windows standard colors for each section and border
+        let border_color = 0xFF000000u32.to_ne_bytes(); // Black border
+        let color_top_left = 0xFF0078D7u32.to_ne_bytes(); // Blue
+        let color_top_right = 0xFF00BCF2u32.to_ne_bytes(); // Light Blue
+        let color_bottom_left = 0xFF7FBA00u32.to_ne_bytes(); // Green
+        let color_bottom_right = 0xFFF25022u32.to_ne_bytes(); // Orange
+
+        let rect_width = 200 as i32;
+        let rect_height = 200 as i32;
+        println!("{}", self.width);
+        println!("{}", self.height);
+        let rect_x = (width as i32 - rect_width) / 2;
+        let rect_y = (height as i32 - rect_height) / 2;
+        let border_thickness = 10;
 
         for y in 0..height as i32 {
             for x in 0..width as i32 {
-                let dx = x - cx;
-                let dy = y - cy;
-                if dx * dx + dy * dy <= radius * radius {
-                    let offset = (y * stride + x * 4) as usize;
-                    canvas[offset..offset + 4].copy_from_slice(&color);
+                let offset = (y * stride + x * 4) as usize;
+
+                // Check if pixel is within the border
+                if x >= rect_x - border_thickness
+                    && x < rect_x + rect_width + border_thickness
+                    && y >= rect_y - border_thickness
+                    && y < rect_y + rect_height + border_thickness
+                    && (x < rect_x
+                        || x >= rect_x + rect_width
+                        || y < rect_y
+                        || y >= rect_y + rect_height)
+                {
+                    canvas[offset..offset + 4].copy_from_slice(&border_color);
+                }
+                // Check if pixel is within the rectangle
+                else if x >= rect_x
+                    && x < rect_x + rect_width
+                    && y >= rect_y
+                    && y < rect_y + rect_height
+                {
+                    // Determine which section the pixel is in
+                    if y < rect_y + rect_height / 2 {
+                        if x < rect_x + rect_width / 2 {
+                            canvas[offset..offset + 4].copy_from_slice(&color_top_left);
+                        } else {
+                            canvas[offset..offset + 4].copy_from_slice(&color_top_right);
+                        }
+                    } else {
+                        if x < rect_x + rect_width / 2 {
+                            canvas[offset..offset + 4].copy_from_slice(&color_bottom_left);
+                        } else {
+                            canvas[offset..offset + 4].copy_from_slice(&color_bottom_right);
+                        }
+                    }
                 }
             }
         }
@@ -113,12 +154,78 @@ impl Foam {
             .expect("buffer attach err");
         self.layer.commit();
     }
+}
 
-    pub fn resize(&mut self, width: u32, height: u32, qh: &QueueHandle<Self>) {
-        self.width = width;
-        self.height = height;
-        self.status = Some(Status::CHANGE);
-        self.draw(qh)
+pub fn run(app: AppDate) {
+    let conn = Connection::connect_to_env().unwrap();
+
+    let (globals, event_queue) = registry_queue_init(&conn).unwrap();
+    let qh = event_queue.handle();
+    let mut event_loop: EventLoop<Foam> =
+        EventLoop::try_new().expect("Failed to initialize event loop");
+    let loop_handle = event_loop.handle();
+    WaylandSource::new(conn, event_queue)
+        .insert(loop_handle)
+        .unwrap();
+    let compositor = smithay_client_toolkit::compositor::CompositorState::bind(&globals, &qh)
+        .expect("wl_compositor is not available");
+    let layer_shell = LayerShell::bind(&globals, &qh).expect("layer shell is not available");
+    let shm = Shm::bind(&globals, &qh).expect("wl_shm is not available");
+
+    let surface = compositor.create_surface(&qh);
+
+    let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Top, Some("Foam"), None);
+    // layer.set_anchor(Anchor::all());
+    // layer.set_margin(0, 0, 0, 0);
+    layer.set_layer(Layer::Bottom);
+    layer.set_size(1366, 768);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+
+    layer.commit();
+    let pool = SlotPool::new(256 * 256 * 4, &shm).expect("Failed to create pool");
+
+    let mut foam = Foam {
+        registry_state: RegistryState::new(&globals),
+        seat_state: SeatState::new(&globals, &qh),
+        output_state: OutputState::new(&globals, &qh),
+        shm,
+
+        exit: false,
+        first_configure: true,
+        pool,
+        width: 256,
+        height: 256,
+        status: Some(Status::RUNNING),
+        layer,
+        pointer: None,
+        scale_factor: 1,
+        next_action: None,
+        loop_handle: event_loop.handle(),
+        cursor: (0.0, 0.0),
+        app,
+    };
+
+    loop {
+        event_loop
+            .dispatch(Duration::from_millis(50), &mut foam)
+            .unwrap();
+        match &foam.next_action.take() {
+            Some(Action::EXIT) => foam.exit = true,
+            // Some(Action::MAX) => {
+            //     foam.resize(256, 512, &qh);
+            //     println!("max")
+            // }
+            // Some(Action::MIN) => {
+            //     foam.resize(256, 256, &qh);
+            //     println!("MIN")
+            // }
+            _ => {}
+        }
+
+        if foam.exit {
+            debug!("exit!");
+            break;
+        }
     }
 }
 
@@ -223,7 +330,7 @@ impl LayerShellHandler for Foam {
         _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
         _layer: &LayerSurface,
     ) {
-        self.is_show = false;
+        self.exit = true;
     }
 
     fn configure(
@@ -231,19 +338,21 @@ impl LayerShellHandler for Foam {
         _conn: &smithay_client_toolkit::reexports::client::Connection,
         qh: &QueueHandle<Self>,
         _layer: &LayerSurface,
-        configure: smithay_client_toolkit::shell::wlr_layer::LayerSurfaceConfigure,
+        _configure: smithay_client_toolkit::shell::wlr_layer::LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        if configure.new_size.0 == 0 || configure.new_size.1 == 0 {
-            self.width = 256;
-            self.height = 256;
-        } else {
-            self.width = configure.new_size.0;
-            self.height = configure.new_size.1;
-        }
-
-        if !self.has_init {
-            self.has_init = true;
+        // if configure.new_size.0 == 0 || configure.new_size.1 == 0 {
+        //     self.width = 256;
+        //     self.height = 256;
+        // } else {
+        //     println!("{}", configure.new_size.1);
+        //     println!("{}", configure.new_size.0);
+        //     self.width = configure.new_size.0;
+        //     self.height = configure.new_size.1;
+        // }
+        //
+        if self.first_configure {
+            self.first_configure = false;
 
             self.draw(qh);
         }
@@ -322,23 +431,80 @@ impl PointerHandler for Foam {
                 continue;
             }
             self.cursor = event.position;
-            //NOTE: byd 是layer内部的相对坐标
+
+            let rect_width = 200;
+            let rect_height = 200;
+            let rect_x = (self.width as i32 - rect_width) / 2;
+            let rect_y = (self.height as i32 - rect_height) / 2;
+
+            let top_left_region = (
+                rect_x,
+                rect_y,
+                rect_x + rect_width / 2,
+                rect_y + rect_height / 2,
+            );
+            let top_right_region = (
+                rect_x + rect_width / 2,
+                rect_y,
+                rect_x + rect_width,
+                rect_y + rect_height / 2,
+            );
+            let bottom_left_region = (
+                rect_x,
+                rect_y + rect_height / 2,
+                rect_x + rect_width / 2,
+                rect_y + rect_height,
+            );
+            let bottom_right_region = (
+                rect_x + rect_width / 2,
+                rect_y + rect_height / 2,
+                rect_x + rect_width,
+                rect_y + rect_height,
+            );
 
             match event.kind {
                 Enter { .. } => {
                     println!("enter!");
-                    self.next_action = Some(Action::MAX); // 鼠标进入时扩大
                 }
                 Leave { .. } => {
                     println!("Leave!");
-                    self.next_action = Some(Action::MIN); // 鼠标离开时缩小
                 }
                 Press { .. } => {
                     println!("click!");
-                    self.next_action = Some(Action::EXIT);
+                    if (self.cursor.0 as i32 >= top_left_region.0)
+                        && (self.cursor.0 as i32 <= top_left_region.2)
+                        && (self.cursor.1 as i32 >= top_left_region.1)
+                        && (self.cursor.1 as i32 <= top_left_region.3)
+                    {
+                        println!("Top-Left Region Clicked!");
+                        // Add your top-left region click event logic here
+                    } else if (self.cursor.0 as i32 >= top_right_region.0)
+                        && (self.cursor.0 as i32 <= top_right_region.2)
+                        && (self.cursor.1 as i32 >= top_right_region.1)
+                        && (self.cursor.1 as i32 <= top_right_region.3)
+                    {
+                        println!("Top-Right Region Clicked!");
+                        // Add your top-right region click event logic here
+                    } else if (self.cursor.0 as i32 >= bottom_left_region.0)
+                        && (self.cursor.0 as i32 <= bottom_left_region.2)
+                        && (self.cursor.1 as i32 >= bottom_left_region.1)
+                        && (self.cursor.1 as i32 <= bottom_left_region.3)
+                    {
+                        println!("Bottom-Left Region Clicked!");
+                        // Add your bottom-left region click event logic here
+                    } else if (self.cursor.0 as i32 >= bottom_right_region.0)
+                        && (self.cursor.0 as i32 <= bottom_right_region.2)
+                        && (self.cursor.1 as i32 >= bottom_right_region.1)
+                        && (self.cursor.1 as i32 <= bottom_right_region.3)
+                    {
+                        println!("Bottom-Right Region Clicked!");
+                        // Add your bottom-right region click event logic here
+                    } else {
+                        self.next_action = Some(Action::EXIT);
+                    }
                 }
                 Motion { .. } => {
-                    println!("{} : {}", self.cursor.0, self.cursor.1);
+                    // println!("{} : {}", self.cursor.0, self.cursor.1);
                 }
                 _ => {}
             }
@@ -407,78 +573,6 @@ impl ProvidesRegistryState for Foam {
         &mut self.registry_state
     }
     registry_handlers![OutputState, SeatState];
-}
-
-pub fn run(app: AppDate) {
-    let conn = Connection::connect_to_env().unwrap();
-
-    let (globals, event_queue) = registry_queue_init(&conn).unwrap();
-    let qh = event_queue.handle();
-    let mut event_loop: EventLoop<Foam> =
-        EventLoop::try_new().expect("Failed to initialize event loop");
-    let loop_handle = event_loop.handle();
-    WaylandSource::new(conn, event_queue)
-        .insert(loop_handle)
-        .unwrap();
-    let compositor = smithay_client_toolkit::compositor::CompositorState::bind(&globals, &qh)
-        .expect("wl_compositor is not available");
-    let layer_shell = LayerShell::bind(&globals, &qh).expect("layer shell is not available");
-    let shm = Shm::bind(&globals, &qh).expect("wl_shm is not available");
-
-    let surface = compositor.create_surface(&qh);
-
-    let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Top, Some("Foam"), None);
-    layer.set_anchor(Anchor::LEFT | Anchor::RIGHT | Anchor::TOP | Anchor::BOTTOM);
-    layer.set_margin(200, 0, 0, 400);
-    layer.set_size(256, 256);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
-
-    layer.commit();
-    let pool = SlotPool::new(256 * 256 * 4, &shm).expect("Failed to create pool");
-
-    let mut foam = Foam {
-        registry_state: RegistryState::new(&globals),
-        seat_state: SeatState::new(&globals, &qh),
-        output_state: OutputState::new(&globals, &qh),
-        shm,
-
-        is_show: true,
-        has_init: false,
-        pool,
-        width: 256,
-        height: 256,
-        status: Some(Status::RUNNING),
-        layer,
-        pointer: None,
-        scale_factor: 1,
-        next_action: None,
-        loop_handle: event_loop.handle(),
-        cursor: (0.0, 0.0),
-        app,
-    };
-
-    loop {
-        event_loop
-            .dispatch(Duration::from_millis(50), &mut foam)
-            .unwrap();
-        match &foam.next_action.take() {
-            Some(Action::EXIT) => foam.is_show = false,
-            Some(Action::MAX) => {
-                foam.resize(256, 512, &qh);
-                println!("max")
-            }
-            Some(Action::MIN) => {
-                foam.resize(256, 256, &qh);
-                println!("MIN")
-            }
-            _ => {}
-        }
-
-        if !foam.is_show {
-            debug!("exit!");
-            break;
-        }
-    }
 }
 
 delegate_compositor!(Foam);
