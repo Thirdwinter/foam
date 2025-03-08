@@ -319,26 +319,3 @@ pub fn run(app: AppDate) {
         }
     }
 }
-
-// 修改cairo_draw函数以接受动态尺寸
-fn cairo_draw(width: i32, height: i32) -> ImageSurface {
-    let surface =
-        ImageSurface::create(Format::ARgb32, width, height).expect("Failed to create surface");
-    let ctx = Context::new(&surface).unwrap();
-
-    // 绘制示例内容
-    ctx.set_source_rgb(1.0, 1.0, 1.0); // 白色背景
-    ctx.paint().unwrap();
-
-    ctx.set_source_rgb(1.0, 0.0, 0.0); // 红色矩形
-    ctx.rectangle(50.0, 50.0, (width - 100) as f64, (height - 100) as f64);
-    ctx.fill().unwrap();
-
-    ctx.set_source_rgb(0.0, 0.0, 0.0); // 黑色文字
-    ctx.select_font_face("Arial", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
-    ctx.set_font_size(40.0);
-    ctx.move_to(60.0, height as f64 / 2.0);
-    ctx.show_text("Hello Wayland!").unwrap();
-
-    surface
-}
