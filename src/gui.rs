@@ -1,12 +1,9 @@
-use std::time::Duration;
+use std::{error::Error, time::Duration};
 
-// use cairo::glib::bitflags::Flags;
+use cairo::{Context, Format, ImageSurface};
 use log::debug;
 use smithay_client_toolkit::{
-    compositor::CompositorHandler,
-    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
-    delegate_registry, delegate_seat, delegate_shm,
-    output::{OutputHandler, OutputState},
+    output::OutputState,
     reexports::{
         calloop::{EventLoop, LoopHandle},
         calloop_wayland_source::WaylandSource,
@@ -16,66 +13,71 @@ use smithay_client_toolkit::{
             Connection, QueueHandle,
         },
     },
-    registry::{ProvidesRegistryState, RegistryState},
-    registry_handlers,
-    seat::{
-        keyboard::KeyboardHandler,
-        pointer::{PointerEventKind, PointerHandler},
-        SeatHandler, SeatState,
-    },
+    registry::RegistryState,
+    seat::SeatState,
     shell::{
-        wlr_layer::{
-            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
-        },
+        wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerSurface},
         WaylandSurface,
     },
-    shm::{slot::SlotPool, Shm, ShmHandler},
+    shm::{slot::SlotPool, Shm},
 };
 
-enum Action {
+use crate::button::*;
+
+#[allow(unused)]
+pub enum Action {
     EXIT,
-    MAX,
-    MIN,
+    COLOR,
 }
 
-enum Status {
+#[allow(unused)]
+pub enum Status {
     RUNNING,
     CHANGE,
 }
 pub struct AppDate {}
 
-struct Foam {
-    registry_state: RegistryState,
-    seat_state: SeatState,
-    output_state: OutputState,
-    shm: Shm,
+#[allow(unused)]
+pub struct Foam {
+    pub registry_state: RegistryState,
+    pub seat_state: SeatState,
+    pub output_state: OutputState,
+    pub shm: Shm,
 
-    layer: LayerSurface,
-    pointer: Option<wl_pointer::WlPointer>,
-    scale_factor: i32,
-    pool: SlotPool,
+    pub layer: LayerSurface,
+    pub pointer: Option<wl_pointer::WlPointer>,
+    pub keyboard: Option<wl_keyboard::WlKeyboard>,
+    pub scale_factor: i32,
+    pub pool: SlotPool,
 
-    exit: bool,
-    first_configure: bool,
-    next_action: Option<Action>,
+    pub exit: bool,
+    pub first_configure: bool,
+    pub next_action: Option<Action>,
+    pub app: AppDate,
+    pub status: Option<Status>,
 
-    app: AppDate,
-    status: Option<Status>,
+    pub sc_width: u32,
+    pub sc_height: u32,
 
-    width: u32,
-    height: u32,
+    pub width: u32,
+    pub height: u32,
 
-    loop_handle: LoopHandle<'static, Foam>,
-    cursor: (f64, f64),
+    pub loop_handle: LoopHandle<'static, Foam>,
+    pub position: (f64, f64),
+    pub buttons: Vec<Button>,
 }
 
 impl Foam {
-    pub fn draw(&mut self, qh: &QueueHandle<Self>) {
-        let width = self.width * self.scale_factor as u32;
-        let height = self.height * self.scale_factor as u32;
+    pub fn draw(&mut self, qh: &QueueHandle<Self>) -> Result<(), Box<dyn Error>> {
+        // 计算实际显示尺寸（考虑缩放因子）
+        let width = self.sc_width * self.scale_factor as u32;
+        let height = self.sc_height * self.scale_factor as u32;
         let stride = width as i32 * 4;
+
+        // 设置图层大小
         self.layer.set_size(width, height);
 
+        // 创建缓冲区
         let (buffer, canvas) = self
             .pool
             .create_buffer(
@@ -84,75 +86,123 @@ impl Foam {
                 stride,
                 wl_shm::Format::Argb8888,
             )
-            .expect("Failed to create buffer");
+            .map_err(|e| format!("Failed to create buffer: {}", e))?;
+
+        // 初始化缓冲区
         canvas.fill(0);
 
-        // Define Windows standard colors for each section and border
-        let border_color = 0xFF000000u32.to_ne_bytes(); // Black border
-        let color_top_left = 0xFF0078D7u32.to_ne_bytes(); // Blue
-        let color_top_right = 0xFF00BCF2u32.to_ne_bytes(); // Light Blue
-        let color_bottom_left = 0xFF7FBA00u32.to_ne_bytes(); // Green
-        let color_bottom_right = 0xFFF25022u32.to_ne_bytes(); // Orange
+        // 创建 Cairo surface
+        let surface = unsafe {
+            ImageSurface::create_for_data(
+                std::slice::from_raw_parts_mut(canvas.as_mut_ptr(), canvas.len()),
+                Format::ARgb32,
+                width as i32,
+                height as i32,
+                stride,
+            )
+            .map_err(|e| format!("Failed to create Cairo surface: {}", e))?
+        };
 
-        let rect_width = 200 as i32;
-        let rect_height = 200 as i32;
-        println!("{}", self.width);
-        println!("{}", self.height);
-        let rect_x = (width as i32 - rect_width) / 2;
-        let rect_y = (height as i32 - rect_height) / 2;
-        let border_thickness = 10;
+        // 创建 Cairo 上下文
+        let ctx =
+            Context::new(&surface).map_err(|e| format!("Failed to create Cairo context: {}", e))?;
 
-        for y in 0..height as i32 {
-            for x in 0..width as i32 {
-                let offset = (y * stride + x * 4) as usize;
+        // 清空背景为透明
+        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+        ctx.set_operator(cairo::Operator::Source);
+        ctx.paint()
+            .map_err(|e| format!("Failed to paint background: {}", e))?;
 
-                // Check if pixel is within the border
-                if x >= rect_x - border_thickness
-                    && x < rect_x + rect_width + border_thickness
-                    && y >= rect_y - border_thickness
-                    && y < rect_y + rect_height + border_thickness
-                    && (x < rect_x
-                        || x >= rect_x + rect_width
-                        || y < rect_y
-                        || y >= rect_y + rect_height)
-                {
-                    canvas[offset..offset + 4].copy_from_slice(&border_color);
-                }
-                // Check if pixel is within the rectangle
-                else if x >= rect_x
-                    && x < rect_x + rect_width
-                    && y >= rect_y
-                    && y < rect_y + rect_height
-                {
-                    // Determine which section the pixel is in
-                    if y < rect_y + rect_height / 2 {
-                        if x < rect_x + rect_width / 2 {
-                            canvas[offset..offset + 4].copy_from_slice(&color_top_left);
-                        } else {
-                            canvas[offset..offset + 4].copy_from_slice(&color_top_right);
-                        }
-                    } else {
-                        if x < rect_x + rect_width / 2 {
-                            canvas[offset..offset + 4].copy_from_slice(&color_bottom_left);
-                        } else {
-                            canvas[offset..offset + 4].copy_from_slice(&color_bottom_right);
-                        }
-                    }
-                }
+        // 加载本地图片
+        // 修改图片加载部分的代码
+        let image_path = "asstes/Anime-Girl4.png"; // 替换为实际的图片路径
+        let image_surface = match std::fs::File::open(image_path) {
+            Ok(mut file) => ImageSurface::create_from_png(&mut file)
+                .map_err(|e| format!("Failed to load image: {}", e))?,
+            Err(e) => {
+                eprintln!("Warning: Failed to open image file: {}", e);
+                ctx.set_source_rgb(1.0, 0.0, 0.0);
+                ctx.rectangle(0.0, 0.0, 200.0, 200.0);
+                ctx.fill()
+                    .map_err(|e| format!("Failed to draw fallback rectangle: {}", e))?;
+                return Ok(());
             }
-        }
+        };
 
+        // 获取图片尺寸
+        let img_width = image_surface.width() as f64;
+        let img_height = image_surface.height() as f64;
+
+        // 计算缩放比例（保持宽高比）
+        let target_width = 200.0;
+        let scale = target_width / img_width;
+        let scaled_height = img_height * scale;
+
+        // 保存当前绘图状态
+        ctx.save()
+            .map_err(|e| format!("Failed to save context state: {}", e))?;
+
+        // 设置缩放和位置
+        ctx.scale(scale, scale);
+        ctx.set_source_surface(&image_surface, 0.0, 0.0)
+            .map_err(|e| format!("Failed to set image as source: {}", e))?;
+
+        // 设置图像混合模式
+        ctx.set_operator(cairo::Operator::Over);
+
+        // 绘制图像
+        ctx.paint()
+            .map_err(|e| format!("Failed to paint image: {}", e))?;
+
+        // 恢复绘图状态
+        ctx.restore()
+            .map_err(|e| format!("Failed to restore context state: {}", e))?;
+
+        // 设置文本样式
+        ctx.set_source_rgb(1.0, 1.0, 1.0); // 白色文字
+        ctx.select_font_face(
+            "Maple Mono NF CN",
+            cairo::FontSlant::Italic,
+            cairo::FontWeight::Bold,
+        );
+        ctx.set_font_size(14.0);
+
+        // 在图片下方绘制文字
+        let text = "Hello Wayland!";
+        let text_extents = ctx
+            .text_extents(text)
+            .map_err(|e| format!("Failed to get text extents: {}", e))?;
+
+        // 计算文字位置（居中）
+        let text_x = (width as f64 - text_extents.width()) / 2.0;
+        let text_y = scaled_height + 20.0; // 图片下方20像素处
+
+        ctx.move_to(text_x, text_y);
+        ctx.show_text(text)
+            .map_err(|e| format!("Failed to draw text: {}", e))?;
+
+        // 完成绘制
+        surface.flush();
+
+        // 更新 surface
         self.layer
             .wl_surface()
             .damage_buffer(0, 0, width as i32, height as i32);
+
+        // 请求新一帧
         self.layer
             .wl_surface()
             .frame(qh, self.layer.wl_surface().clone());
 
+        // 附加缓冲区到 surface
         buffer
             .attach_to(self.layer.wl_surface())
-            .expect("buffer attach err");
+            .map_err(|e| format!("Failed to attach buffer: {}", e))?;
+
+        // 提交更改
         self.layer.commit();
+
+        Ok(())
     }
 }
 
@@ -171,38 +221,86 @@ pub fn run(app: AppDate) {
         .expect("wl_compositor is not available");
     let layer_shell = LayerShell::bind(&globals, &qh).expect("layer shell is not available");
     let shm = Shm::bind(&globals, &qh).expect("wl_shm is not available");
+    let output = OutputState::new(&globals, &qh);
 
     let surface = compositor.create_surface(&qh);
 
     let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Top, Some("Foam"), None);
-    // layer.set_anchor(Anchor::all());
+    layer.set_anchor(Anchor::all());
     // layer.set_margin(0, 0, 0, 0);
     layer.set_layer(Layer::Bottom);
-    layer.set_size(1366, 768);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+    // layer.set_size(1366, 768);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
 
     layer.commit();
     let pool = SlotPool::new(256 * 256 * 4, &shm).expect("Failed to create pool");
 
+    let sc_width = 200;
+    let sc_height = 200;
+    let width = 200;
+    let height = 200;
+    let buttons = vec![
+        Button::new(
+            "left_top".to_string(),
+            (sc_width - width) / 2,
+            (sc_height - height) / 2,
+            width / 2,
+            height / 2,
+            0xFF0078D7u32.to_ne_bytes(),
+            0xFF000000u32.to_ne_bytes(),
+        ),
+        Button::new(
+            "right_top".to_string(),
+            (sc_width - width) / 2 + width / 2,
+            (sc_height - height) / 2,
+            width / 2,
+            height / 2,
+            0xFF00BCF2u32.to_ne_bytes(),
+            0xFF000000u32.to_ne_bytes(),
+        ),
+        Button::new(
+            "left_bottom".to_string(),
+            (sc_width - width) / 2,
+            (sc_height - height) / 2 + height / 2,
+            width / 2,
+            height / 2,
+            0xFF7FBA00u32.to_ne_bytes(),
+            0xFF000000u32.to_ne_bytes(),
+        ),
+        Button::new(
+            "right_bottom".to_string(),
+            (sc_width - width) / 2 + width / 2,
+            (sc_height - height) / 2 + height / 2,
+            width / 2,
+            height / 2,
+            0xFFF25022u32.to_ne_bytes(),
+            0xFF000000u32.to_ne_bytes(),
+        ),
+    ];
+
     let mut foam = Foam {
         registry_state: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
-        output_state: OutputState::new(&globals, &qh),
+        output_state: output,
         shm,
 
         exit: false,
         first_configure: true,
         pool,
-        width: 256,
-        height: 256,
+        sc_width: (sc_width as u32),
+        sc_height: (sc_height as u32),
+        height: (height as u32),
+        width: (width as u32),
         status: Some(Status::RUNNING),
         layer,
         pointer: None,
+        keyboard: None,
         scale_factor: 1,
         next_action: None,
         loop_handle: event_loop.handle(),
-        cursor: (0.0, 0.0),
+        position: (0.0, 0.0),
         app,
+        buttons,
     };
 
     loop {
@@ -211,14 +309,7 @@ pub fn run(app: AppDate) {
             .unwrap();
         match &foam.next_action.take() {
             Some(Action::EXIT) => foam.exit = true,
-            // Some(Action::MAX) => {
-            //     foam.resize(256, 512, &qh);
-            //     println!("max")
-            // }
-            // Some(Action::MIN) => {
-            //     foam.resize(256, 256, &qh);
-            //     println!("MIN")
-            // }
+            // Some(Action::COLOR) => foam.draw(&qh),
             _ => {}
         }
 
@@ -229,357 +320,25 @@ pub fn run(app: AppDate) {
     }
 }
 
-impl CompositorHandler for Foam {
-    fn scale_factor_changed(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
-        new_factor: i32,
-    ) {
-        self.scale_factor = new_factor;
-        self.layer.set_buffer_scale(new_factor as u32).unwrap();
-    }
+// 修改cairo_draw函数以接受动态尺寸
+fn cairo_draw(width: i32, height: i32) -> ImageSurface {
+    let surface =
+        ImageSurface::create(Format::ARgb32, width, height).expect("Failed to create surface");
+    let ctx = Context::new(&surface).unwrap();
 
-    fn transform_changed(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
-        _new_transform: smithay_client_toolkit::reexports::client::protocol::wl_output::Transform,
-    ) {
-    }
+    // 绘制示例内容
+    ctx.set_source_rgb(1.0, 1.0, 1.0); // 白色背景
+    ctx.paint().unwrap();
 
-    fn frame(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
-        _time: u32,
-    ) {
-        match self.status.take() {
-            Some(Status::RUNNING) => {
-                return;
-            }
-            Some(Status::CHANGE) => {
-                println!("change!");
+    ctx.set_source_rgb(1.0, 0.0, 0.0); // 红色矩形
+    ctx.rectangle(50.0, 50.0, (width - 100) as f64, (height - 100) as f64);
+    ctx.fill().unwrap();
 
-                self.draw(qh);
-                self.status = Some(Status::RUNNING);
-            }
+    ctx.set_source_rgb(0.0, 0.0, 0.0); // 黑色文字
+    ctx.select_font_face("Arial", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
+    ctx.set_font_size(40.0);
+    ctx.move_to(60.0, height as f64 / 2.0);
+    ctx.show_text("Hello Wayland!").unwrap();
 
-            _ => {}
-        }
-    }
-
-    fn surface_enter(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
-        _output: &smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
-    ) {
-        println!("enter surface_enter");
-    }
-
-    fn surface_leave(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
-        _output: &smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
-    ) {
-        println!("leave surface_enter");
-    }
+    surface
 }
-
-impl OutputHandler for Foam {
-    fn output_state(&mut self) -> &mut OutputState {
-        &mut self.output_state
-    }
-
-    fn new_output(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _output: smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
-    ) {
-    }
-
-    fn update_output(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _output: smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
-    ) {
-    }
-
-    fn output_destroyed(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _output: smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
-    ) {
-    }
-}
-
-impl LayerShellHandler for Foam {
-    fn closed(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _layer: &LayerSurface,
-    ) {
-        self.exit = true;
-    }
-
-    fn configure(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
-        _configure: smithay_client_toolkit::shell::wlr_layer::LayerSurfaceConfigure,
-        _serial: u32,
-    ) {
-        // if configure.new_size.0 == 0 || configure.new_size.1 == 0 {
-        //     self.width = 256;
-        //     self.height = 256;
-        // } else {
-        //     println!("{}", configure.new_size.1);
-        //     println!("{}", configure.new_size.0);
-        //     self.width = configure.new_size.0;
-        //     self.height = configure.new_size.1;
-        // }
-        //
-        if self.first_configure {
-            self.first_configure = false;
-
-            self.draw(qh);
-        }
-    }
-}
-
-impl KeyboardHandler for Foam {
-    fn enter(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
-        _serial: u32,
-        _raw: &[u32],
-        _keysyms: &[smithay_client_toolkit::seat::keyboard::Keysym],
-    ) {
-    }
-
-    fn leave(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        _surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
-        _serial: u32,
-    ) {
-    }
-
-    fn press_key(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        _serial: u32,
-        event: smithay_client_toolkit::seat::keyboard::KeyEvent,
-    ) {
-        debug!("Key press: {event:?}");
-    }
-
-    fn release_key(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        _serial: u32,
-        event: smithay_client_toolkit::seat::keyboard::KeyEvent,
-    ) {
-        debug!("Key release: {event:?}");
-    }
-
-    fn update_modifiers(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        _serial: u32,
-        modifiers: smithay_client_toolkit::seat::keyboard::Modifiers,
-        _layout: u32,
-    ) {
-        debug!("Update modifiers: {modifiers:?}");
-    }
-}
-
-impl PointerHandler for Foam {
-    fn pointer_frame(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        _qh: &QueueHandle<Self>,
-        _pointer: &wl_pointer::WlPointer,
-        events: &[smithay_client_toolkit::seat::pointer::PointerEvent],
-    ) {
-        use PointerEventKind::{Enter, Leave, Motion, Press};
-        for event in events {
-            if &event.surface != self.layer.wl_surface() {
-                continue;
-            }
-            self.cursor = event.position;
-
-            let rect_width = 200;
-            let rect_height = 200;
-            let rect_x = (self.width as i32 - rect_width) / 2;
-            let rect_y = (self.height as i32 - rect_height) / 2;
-
-            let top_left_region = (
-                rect_x,
-                rect_y,
-                rect_x + rect_width / 2,
-                rect_y + rect_height / 2,
-            );
-            let top_right_region = (
-                rect_x + rect_width / 2,
-                rect_y,
-                rect_x + rect_width,
-                rect_y + rect_height / 2,
-            );
-            let bottom_left_region = (
-                rect_x,
-                rect_y + rect_height / 2,
-                rect_x + rect_width / 2,
-                rect_y + rect_height,
-            );
-            let bottom_right_region = (
-                rect_x + rect_width / 2,
-                rect_y + rect_height / 2,
-                rect_x + rect_width,
-                rect_y + rect_height,
-            );
-
-            match event.kind {
-                Enter { .. } => {
-                    println!("enter!");
-                }
-                Leave { .. } => {
-                    println!("Leave!");
-                }
-                Press { .. } => {
-                    println!("click!");
-                    if (self.cursor.0 as i32 >= top_left_region.0)
-                        && (self.cursor.0 as i32 <= top_left_region.2)
-                        && (self.cursor.1 as i32 >= top_left_region.1)
-                        && (self.cursor.1 as i32 <= top_left_region.3)
-                    {
-                        println!("Top-Left Region Clicked!");
-                        // Add your top-left region click event logic here
-                    } else if (self.cursor.0 as i32 >= top_right_region.0)
-                        && (self.cursor.0 as i32 <= top_right_region.2)
-                        && (self.cursor.1 as i32 >= top_right_region.1)
-                        && (self.cursor.1 as i32 <= top_right_region.3)
-                    {
-                        println!("Top-Right Region Clicked!");
-                        // Add your top-right region click event logic here
-                    } else if (self.cursor.0 as i32 >= bottom_left_region.0)
-                        && (self.cursor.0 as i32 <= bottom_left_region.2)
-                        && (self.cursor.1 as i32 >= bottom_left_region.1)
-                        && (self.cursor.1 as i32 <= bottom_left_region.3)
-                    {
-                        println!("Bottom-Left Region Clicked!");
-                        // Add your bottom-left region click event logic here
-                    } else if (self.cursor.0 as i32 >= bottom_right_region.0)
-                        && (self.cursor.0 as i32 <= bottom_right_region.2)
-                        && (self.cursor.1 as i32 >= bottom_right_region.1)
-                        && (self.cursor.1 as i32 <= bottom_right_region.3)
-                    {
-                        println!("Bottom-Right Region Clicked!");
-                        // Add your bottom-right region click event logic here
-                    } else {
-                        self.next_action = Some(Action::EXIT);
-                    }
-                }
-                Motion { .. } => {
-                    // println!("{} : {}", self.cursor.0, self.cursor.1);
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-impl SeatHandler for Foam {
-    fn seat_state(&mut self) -> &mut SeatState {
-        &mut self.seat_state
-    }
-
-    fn new_seat(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
-    ) {
-        println!("enter new seat");
-    }
-
-    fn new_capability(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        qh: &QueueHandle<Self>,
-        seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
-        capability: smithay_client_toolkit::seat::Capability,
-    ) {
-        if capability == smithay_client_toolkit::seat::Capability::Pointer && self.pointer.is_none()
-        {
-            debug!("Set pointer capability");
-            let pointer = self
-                .seat_state
-                .get_pointer(qh, &seat)
-                .expect("Failed to create pointer");
-            self.pointer = Some(pointer);
-        }
-    }
-
-    fn remove_capability(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
-        _capability: smithay_client_toolkit::seat::Capability,
-    ) {
-    }
-
-    fn remove_seat(
-        &mut self,
-        _conn: &smithay_client_toolkit::reexports::client::Connection,
-        _qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        _seat: smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat,
-    ) {
-    }
-}
-
-impl ShmHandler for Foam {
-    fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm
-    }
-}
-
-impl ProvidesRegistryState for Foam {
-    fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry_state
-    }
-    registry_handlers![OutputState, SeatState];
-}
-
-delegate_compositor!(Foam);
-delegate_output!(Foam);
-delegate_shm!(Foam);
-delegate_seat!(Foam);
-delegate_keyboard!(Foam);
-delegate_pointer!(Foam);
-delegate_layer!(Foam);
-delegate_registry!(Foam);
